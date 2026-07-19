@@ -1,1 +1,121 @@
 
+name: Fetch Assets
+
+# Haalt externe beeld-/video-URLs op en commit ze in deze repo,
+# zodat ze daarna via raw.githubusercontent.com leesbaar zijn.
+#
+# Trigger via de API:
+#   POST /repos/JmeBae/elyssor-ad-assets/actions/workflows/fetch-assets.yml/dispatches
+#   { "ref": "main", "inputs": { "folder": "fiorella", "urls": "..." } }
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: 'Doelmap onder assets/ (bv. fiorella)'
+        required: true
+        type: string
+      urls:
+        description: 'Eén per regel. Formaat: URL  of  URL|bestandsnaam.png'
+        required: true
+        type: string
+      clean:
+        description: 'Map eerst leegmaken'
+        required: false
+        default: 'false'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-assets-${{ inputs.folder }}
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Valideer mapnaam
+        run: |
+          case "${{ inputs.folder }}" in
+            *[!a-zA-Z0-9_-]*|"")
+              echo "::error::Ongeldige mapnaam. Alleen a-z, 0-9, - en _."
+              exit 1 ;;
+          esac
+
+      - name: Download bestanden
+        env:
+          FOLDER: ${{ inputs.folder }}
+          URLS: ${{ inputs.urls }}
+          CLEAN: ${{ inputs.clean }}
+        run: |
+          set -euo pipefail
+          DEST="assets/$FOLDER"
+
+          if [ "$CLEAN" = "true" ] && [ -d "$DEST" ]; then
+            rm -rf "$DEST"
+          fi
+          mkdir -p "$DEST"
+
+          i=0
+          fail=0
+          printf '%s\n' "$URLS" | while IFS= read -r line; do
+            line="$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$line" ] && continue
+            [ "${line#\#}" != "$line" ] && continue
+
+            i=$((i+1))
+            url="${line%%|*}"
+            if [ "$line" != "$url" ]; then
+              name="${line#*|}"
+            else
+              base="${url##*/}"
+              name="${base%%\?*}"
+              [ -z "$name" ] && name="asset-$i"
+            fi
+
+            # bestandsnaam ontdoen van padtekens
+            name="$(printf '%s' "$name" | tr -cd 'A-Za-z0-9._-')"
+            [ -z "$name" ] && name="asset-$i"
+
+            echo "→ $name"
+            if ! curl -fsSL --retry 3 --retry-delay 2 --max-time 120 \
+                 -A 'Mozilla/5.0 (compatible; asset-fetcher)' \
+                 -o "$DEST/$name" "$url"; then
+              echo "::warning::Mislukt: $url"
+              fail=$((fail+1))
+              continue
+            fi
+
+            if [ ! -s "$DEST/$name" ]; then
+              echo "::warning::Leeg bestand: $url"
+              rm -f "$DEST/$name"
+            fi
+          done
+
+          echo "--- inhoud $DEST ---"
+          ls -la "$DEST"
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          git config user.name  "asset-fetcher"
+          git config user.email "actions@github.com"
+          git add -A "assets/${{ inputs.folder }}"
+          if git diff --staged --quiet; then
+            echo "Niets gewijzigd."
+          else
+            git commit -m "assets: ${{ inputs.folder }}"
+            git push
+          fi
+
+      - name: Toon raw-URLs
+        run: |
+          echo "### Raw-URLs" >> $GITHUB_STEP_SUMMARY
+          for f in assets/${{ inputs.folder }}/*; do
+            [ -e "$f" ] || continue
+            echo "- https://raw.githubusercontent.com/${{ github.repository }}/main/$f" >> $GITHUB_STEP_SUMMARY
+          done
